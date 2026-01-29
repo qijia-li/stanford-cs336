@@ -21,10 +21,39 @@ and the environment will be automatically solved and activated when necessary.
 
 ### Run unit tests
 
+#### Basic Test Commands
 
+**Run all tests:**
 ```sh
 uv run pytest
 ```
+
+**Run only BPE training related tests:**
+```sh
+uv run pytest tests/test_train_bpe.py
+```
+
+**Run a specific test:**
+```sh
+uv run pytest tests/test_train_bpe.py::test_train_bpe
+```
+
+**Show verbose output:**
+```sh
+uv run pytest -v
+```
+
+**Stop at first failure:**
+```sh
+uv run pytest -x
+```
+
+**Run with debug logging (for BPE tokenizer):**
+```sh
+BPE_DEBUG=1 uv run pytest tests/test_train_bpe.py -v
+```
+
+#### Test Organization
 
 Initially, all tests should fail with `NotImplementedError`s.
 To connect your implementation to the tests, complete the
