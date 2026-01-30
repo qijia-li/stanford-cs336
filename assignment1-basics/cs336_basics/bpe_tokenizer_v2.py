@@ -5,6 +5,7 @@ This module provides functionality for training a byte-level BPE tokenizer
 on text corpora.
 """
 
+import heapq
 import logging
 import os
 import regex as re  # Use regex module for Unicode property escapes (\p{L}, \p{N})
@@ -35,7 +36,16 @@ def setup_logging(debug: bool = False, info: bool = False):
         force=True,
     )
 
-
+'''
+This is the second version of the BPE tokenizer.
+It optimizes the training process by
+- using a min-heap to find the most frequent pair of bytes.
+- using a dictionary to store the word byte frequencies.
+- using a set to store the existing tokens.
+- using a list to store the merges.
+- using a function to count the byte pairs.
+- using a function to apply the merge.
+'''
 class BPETokenizer:
     """BPE Tokenizer class for training byte-level BPE tokenizers."""
 
@@ -84,7 +94,7 @@ class BPETokenizer:
         setup_logging(debug=debug_mode, info=info_mode)
 
         if info_mode:
-            logger.info("========== BPE 训练开始 ==========")
+            logger.info("========== BPE training started ==========")
             logger.info("输入: %s, vocab_size=%s, special_tokens=%s", input_path, vocab_size, special_tokens)
 
         # Initialize vocabulary with byte vocabulary and special tokens
@@ -98,8 +108,8 @@ class BPETokenizer:
             return vocab, []
 
         if info_mode:
-            logger.info("Step 1 预分词: 得到 %d 个 token（只含 regex 匹配，不含 special）", len(raw_words))
-            logger.info("  前 20 个: %s", raw_words[:20])
+            logger.info("Step 1 tokenization: %d tokens (only regex matches, no special)", len(raw_words))
+            logger.info("Top 20 tokens: %s", raw_words[:20])
 
         # Convert words to byte-level representation
         word_byte_freqs = BPETokenizer._convert_to_byte_representation(raw_words)
@@ -108,7 +118,7 @@ class BPETokenizer:
             return vocab, []
 
         if info_mode:
-            logger.info("Step 2 转成 byte 表示: 共 %d 种不同的 (byte序列)->频次", len(word_byte_freqs))
+            logger.info("Step 2 convert to byte representation: %d different byte sequences -> frequencies", len(word_byte_freqs))
 
         # Perform BPE training iterations
         merges = BPETokenizer._train_bpe_merges(
@@ -117,7 +127,7 @@ class BPETokenizer:
         )
 
         if info_mode:
-            logger.info("========== BPE 训练结束: 共 %d 次 merge ==========", len(merges))
+            logger.info("========== BPE training completed: %d merges ==========", len(merges))
 
         return vocab, merges
 
@@ -284,7 +294,7 @@ class BPETokenizer:
         skipped_pairs = set()  # Track pairs that create existing tokens
 
         if example_mode:
-            logger.info("Step 3 开始 BPE 迭代: 每次选频次最高的 byte 对合并")
+            logger.info("Step 3 start BPE iterations: Merge the most frequent byte pair each time")
 
         iteration = 0
         while len(vocab) < vocab_size:
@@ -297,43 +307,49 @@ class BPETokenizer:
                 logger.debug("No more pairs to merge")
                 break
 
-            # Find the most frequent pair that hasn't been skipped
-            # When frequencies are equal, we need stable sorting (lexicographic by bytes)
+            # Find the most frequent pair that hasn't been skipped.
+            # Use min-heap by (-count,) so we only pop pairs with current max count;
+            # then sort the (small) batch by pair desc for exact reference tie-break.
+            # O(n) heapify + O(k log n) pops to drain max-count tier + O(m log m) sort
+            # where m = number of pairs with max count (usually 1).
+            max_count = max(pair_counts.values()) if pair_counts else 0
+            # Heap key is just -count so we pop highest-count pairs first
+            heap = [(-c, p) for p, c in pair_counts.items()]
+            heapq.heapify(heap)
             found_valid_pair = False
-            
-            # Tie-break: highest count, then lexicographic by (pair[0], pair[1]) to match reference
-            sorted_pairs = sorted(pair_counts.items(), key=lambda x: (x[1], x[0]), reverse=True)
+            # Drain all pairs with count == max_count (they have key -max_count)
+            candidates = []
+            while heap and heap[0][0] == -max_count:
+                _, pair = heapq.heappop(heap)
+                candidates.append(pair)
+            # Tie-break: sort by pair descending to match reference
+            candidates.sort(key=lambda p: (p[0], p[1]), reverse=True)
 
             # Debug: Log pair frequencies for problematic iterations
             if logger.isEnabledFor(logging.DEBUG) and iteration > 54 and iteration < 80:
                 logger.debug(f"Iteration {iteration}: Top 10 pairs by frequency:")
-                for idx, (p, c) in enumerate(sorted_pairs[:10]):
+                for idx, p in enumerate(candidates[:10]):
                     try:
                         p1_str = p[0].decode('utf-8', errors='replace')
                         p2_str = p[1].decode('utf-8', errors='replace')
-                        logger.debug(f"  {idx}: ({p1_str!r}, {p2_str!r}) = {c}")
-                    except:
-                        logger.debug(f"  {idx}: {p} = {c}")
-            
-            for pair, count in sorted_pairs:
+                        logger.debug(f"  {idx}: ({p1_str!r}, {p2_str!r}) = {max_count}")
+                    except Exception:
+                        logger.debug(f"  {idx}: {p} = {max_count}")
+
+            for pair in candidates:
                 if pair in skipped_pairs:
                     continue
-                
-                most_frequent_pair = pair
                 merged_token = pair[0] + pair[1]
-                
-                # Skip if merged token already exists
                 if merged_token in existed_tokens:
                     skipped_pairs.add(pair)
                     continue
-
-                # Found a valid pair to merge
+                most_frequent_pair = pair
                 found_valid_pair = True
                 if example_mode:
                     t1 = most_frequent_pair[0].decode("utf-8", errors="replace")
                     t2 = most_frequent_pair[1].decode("utf-8", errors="replace")
                     merged_str = merged_token.decode("utf-8", errors="replace")
-                    logger.info("  迭代 %d: 合并 (%r, %r) -> %r (频次=%d)", iteration, t1, t2, merged_str, count)
+                    logger.info("Iteration %d: Merge (%r, %r) -> %r (frequency=%d)", iteration, t1, t2, merged_str, max_count)
                 break
 
             if not found_valid_pair:
@@ -421,93 +437,3 @@ class BPETokenizer:
             else:
                 new_word_byte_freqs[new_word_bytes_tuple] = freq
         return new_word_byte_freqs
-
-
-# if __name__ == "__main__":
-#     # Simple example to test BPE training
-#     import sys
-#     from pathlib import Path
-
-#     # Check for debug mode via environment variable or command line
-#     debug_mode = os.getenv("BPE_DEBUG", "false").lower() in ("true", "1", "yes")
-#     if "--debug" in sys.argv:
-#         debug_mode = True
-    
-#     # Setup logging based on debug mode
-#     setup_logging(debug=debug_mode)
-    
-#     # Use a small test file from fixtures if available, otherwise create a simple test
-#     test_file = Path(__file__).parent.parent / "tests" / "fixtures" / "corpus.en"
-    
-#     if not test_file.exists():
-#         # Create a simple test file if fixtures don't exist
-#         test_file = Path(__file__).parent / "test_input.txt"
-#         test_file.write_text(
-#             "hello world hello world\n"
-#             "this is a test\n"
-#             "hello hello world\n"
-#             '<|endoftext|>'
-#         )
-#         logger.info(f"Created test file: {test_file}")
-    
-#     print("=" * 60)
-#     print("BPE Tokenizer Training Example")
-#     print("=" * 60)
-#     print(f"Input file: {test_file}")
-#     print(f"File exists: {test_file.exists()}")
-#     print(f"Debug mode: {debug_mode} (set BPE_DEBUG=1 or use --debug to enable)")
-    
-#     if test_file.exists():
-#         print("\nStarting BPE training...")
-#         print(f"Target vocab size: 300 (must be > 256 bytes + special tokens to allow merges)")
-#         print(f"Special tokens: ['<|endoftext|>']")
-        
-#         # Read a sample of the file to show what we're working with
-#         with open(test_file, 'r', encoding='utf-8', errors='ignore') as f:
-#             sample = f.read(200)
-        
-#         # Note: vocab_size includes the initial 256 bytes + special tokens
-#         # So if we want to add merges, we need vocab_size > 256 + len(special_tokens)
-#         vocab, merges = BPETokenizer.train(
-#             input_path=str(test_file),
-#             vocab_size=300,  # Must be > 256 + special tokens to allow merges
-#             special_tokens=["<|endoftext|>"]
-#         )
-        
-#         print("\n" + "=" * 60)
-#         print("Training Results:")
-#         print("=" * 60)
-#         print(f"Vocabulary size: {len(vocab)}")
-#         print(f"Number of merges: {len(merges)}")
-        
-#         if len(merges) == 0:
-#             print("\n⚠️  WARNING: No merges were performed!")
-#             print("This might indicate:")
-#             print("  - All pairs create tokens that already exist")
-#             print("  - No valid byte pairs found")
-#             print("  - Vocabulary size limit reached immediately")
-        
-#         print("\nFirst 10 vocabulary items:")
-#         for i, (token_id, token_bytes) in enumerate(sorted(vocab.items())[:10]):
-#             try:
-#                 token_str = token_bytes.decode("utf-8", errors="replace")
-#                 print(f"  {token_id:4d}: {repr(token_str)} (bytes: {token_bytes})")
-#             except:
-#                 print(f"  {token_id:4d}: {token_bytes} (non-UTF8)")
-        
-#         print("\nFirst 10 merges:")
-#         for i, (token1, token2) in enumerate(merges[:10]):
-#             try:
-#                 t1_str = token1.decode("utf-8", errors="replace")
-#                 t2_str = token2.decode("utf-8", errors="replace")
-#                 merged = (token1 + token2).decode("utf-8", errors="replace")
-#                 print(f"  Merge {i+1}: {repr(t1_str)} + {repr(t2_str)} -> {repr(merged)}")
-#             except:
-#                 print(f"  Merge {i+1}: {token1} + {token2} -> {token1 + token2}")
-        
-#         print("\n" + "=" * 60)
-#         print("Example completed successfully!")
-#         print("=" * 60)
-#     else:
-#         logger.error(f"Test file not found at {test_file}")
-#         sys.exit(1)
