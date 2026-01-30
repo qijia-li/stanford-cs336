@@ -53,6 +53,10 @@ uv run pytest -x
 BPE_DEBUG=1 uv run pytest tests/test_train_bpe.py -v
 ```
 
+**Run with multithreading (for BPE tokenizer v3):**
+```sh
+BPE_NUM_WORKERS=64 uv run pytest tests/test_train_bpe.py
+```
 #### Test Organization
 
 Initially, all tests should fail with `NotImplementedError`s.

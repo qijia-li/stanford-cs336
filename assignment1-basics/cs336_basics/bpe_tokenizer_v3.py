@@ -7,12 +7,70 @@ on text corpora.
 
 import heapq
 import logging
+import multiprocessing
 import os
 import regex as re  # Use regex module for Unicode property escapes (\p{L}, \p{N})
 from collections import Counter
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from cs336_basics.constants import DEFAULT_CHUNK_SIZE, PAT
+
+# Multiprocessing: only use parallel when data is large enough to outweigh overhead.
+# Set BPE_NUM_WORKERS > 1 (e.g. 4) to enable parallel processing for large corpora.
+_PARALLEL_THRESHOLD_PRETOKENIZE = 2  # min number of chunks to use parallel pretokenize
+_PARALLEL_THRESHOLD_WORD_FREQS = 2000  # min word_byte_freqs size for parallel count/apply
+_DEFAULT_N_WORKERS = 1  # default 1 = sequential; set BPE_NUM_WORKERS to enable parallel
+
+def _pretokenize_chunk(args: Tuple[str, Optional[str], set]) -> List[str]:
+    """Worker: run regex pretokenization on one chunk. Used by multiprocessing."""
+    chunk, union, special_set = args
+    if union is None:
+        return re.findall(PAT, chunk)
+    parts = re.split(f"({union})", chunk)
+    words = []
+    for part in parts:
+        if not part or part in special_set:
+            continue
+        words.extend(re.findall(PAT, part))
+    return words
+
+
+def _count_pairs_chunk(items_chunk: List[Tuple[Tuple[bytes, ...], int]]) -> Counter:
+    """Worker: count byte pairs in a chunk of word_byte_freqs items."""
+    pair_counts = Counter()
+    for word_bytes_tuple, freq in items_chunk:
+        for i in range(len(word_bytes_tuple) - 1):
+            pair = (word_bytes_tuple[i], word_bytes_tuple[i + 1])
+            pair_counts[pair] += freq
+    return pair_counts
+
+
+def _apply_merge_chunk(
+    args: Tuple[List[Tuple[Tuple[bytes, ...], int]], Tuple[bytes, bytes], bytes]
+) -> Dict[Tuple[bytes, ...], int]:
+    """Worker: apply one merge to a chunk of word_byte_freqs items."""
+    items_chunk, pair_bytes, merged_token = args
+    new_word_byte_freqs = {}
+    for word_bytes_tuple, freq in items_chunk:
+        new_word_bytes = []
+        i = 0
+        while i < len(word_bytes_tuple):
+            if (
+                i < len(word_bytes_tuple) - 1
+                and word_bytes_tuple[i] == pair_bytes[0]
+                and word_bytes_tuple[i + 1] == pair_bytes[1]
+            ):
+                new_word_bytes.append(merged_token)
+                i += 2
+            else:
+                new_word_bytes.append(word_bytes_tuple[i])
+                i += 1
+        new_word_bytes_tuple = tuple(new_word_bytes)
+        if new_word_bytes_tuple in new_word_byte_freqs:
+            new_word_byte_freqs[new_word_bytes_tuple] += freq
+        else:
+            new_word_byte_freqs[new_word_bytes_tuple] = freq
+    return new_word_byte_freqs
 
 # Create logger for this module
 logger = logging.getLogger(__name__)
@@ -37,8 +95,9 @@ def setup_logging(debug: bool = False, info: bool = False):
     )
 
 '''
-This is the second version of the BPE tokenizer.
+This is the third multiprocessing version of the BPE tokenizer.
 It optimizes the training process by
+- using multiprocessing to parallelize the training process.
 - using a min-heap to find the most frequent pair of bytes.
 - using a dictionary to store the word byte frequencies.
 - using a set to store the existing tokens.
@@ -78,7 +137,8 @@ class BPETokenizer:
                 and any special tokens)
             special_tokens: A list of strings to add to the vocabulary. These special tokens
                 do not otherwise affect BPE training
-            **kwargs: Additional keyword arguments (unused)
+            **kwargs: Additional keyword arguments (unused).
+            Parallel processing: set env BPE_NUM_WORKERS > 1 (e.g. 4) for large corpora.
 
         Returns:
             A tuple containing:
@@ -194,23 +254,13 @@ class BPETokenizer:
 
         Chunks end on last occurrence of special token (or whole file at EOF when none). 
         Only regex matches are added; special tokens are boundaries only, not in raw_words.
-
-        Args:
-            input_path: Path to input text file
-            special_tokens: Optional list of special tokens (used as split boundaries).
-
-        Returns:
-            List of pretokenized words (regex matches only, no special tokens).
+        Uses multiprocessing when there are multiple chunks.
         """
-        raw_words = []
         special_tokens = special_tokens or []
-
-        # Use first special token for chunk boundaries
-        special_for_chunk = special_tokens[0] if special_tokens else "\x00"  # unused if no specials
+        special_for_chunk = special_tokens[0] if special_tokens else "\x00"
 
         def get_chunks():
             if not special_tokens:
-                # No special tokens: read whole file and yield once
                 with open(input_path, "r", encoding="utf-8") as f:
                     yield f.read()
                 return
@@ -228,17 +278,20 @@ class BPETokenizer:
                 union = None
                 special_set = set()
 
-            for chunk in get_chunks():
-                if not chunk:
-                    continue
-                if not special_tokens:
-                    raw_words.extend(re.findall(PAT, chunk))
-                    continue
-                parts = re.split(f"({union})", chunk)
-                for part in parts:
-                    if not part or part in special_set:
-                        continue
-                    raw_words.extend(re.findall(PAT, part))
+            chunks_list = [c for c in get_chunks() if c]
+            n_workers = int(os.getenv("BPE_NUM_WORKERS", _DEFAULT_N_WORKERS))
+
+            if len(chunks_list) >= _PARALLEL_THRESHOLD_PRETOKENIZE and n_workers > 1:
+                with multiprocessing.Pool(processes=n_workers) as pool:
+                    chunk_args = [(c, union, special_set) for c in chunks_list]
+                    chunk_results = pool.map(_pretokenize_chunk, chunk_args)
+                raw_words = []
+                for words in chunk_results:
+                    raw_words.extend(words)
+            else:
+                raw_words = []
+                for chunk in chunks_list:
+                    raw_words.extend(_pretokenize_chunk((chunk, union, special_set)))
         except Exception as e:
             logger.error(f"Error pretokenizing the input file: {e}", exc_info=True)
             return []
@@ -296,105 +349,125 @@ class BPETokenizer:
         if example_mode:
             logger.info("Step 3 start BPE iterations: Merge the most frequent byte pair each time")
 
-        iteration = 0
-        while len(vocab) < vocab_size:
-            iteration += 1
-            
-            # Count all adjacent byte pairs
-            pair_counts = BPETokenizer._count_byte_pairs(word_byte_freqs)
-            
-            if not pair_counts:
-                logger.debug("No more pairs to merge")
-                break
+        n_workers = int(os.getenv("BPE_NUM_WORKERS", _DEFAULT_N_WORKERS))
+        pool = multiprocessing.Pool(processes=n_workers) if n_workers > 1 else None
+        try:
+            iteration = 0
+            while len(vocab) < vocab_size:
+                iteration += 1
 
-            # Find the most frequent pair that hasn't been skipped.
-            # Use min-heap by (-count,) so we only pop pairs with current max count;
-            # then sort the (small) batch by pair desc for exact reference tie-break.
-            # O(n) heapify + O(k log n) pops to drain max-count tier + O(m log m) sort
-            # where m = number of pairs with max count (usually 1).
-            max_count = max(pair_counts.values()) if pair_counts else 0
-            # Heap key is just -count so we pop highest-count pairs first
-            heap = [(-c, p) for p, c in pair_counts.items()]
-            heapq.heapify(heap)
-            found_valid_pair = False
-            # Drain all pairs with count == max_count (they have key -max_count)
-            candidates = []
-            while heap and heap[0][0] == -max_count:
-                _, pair = heapq.heappop(heap)
-                candidates.append(pair)
-            # Tie-break: sort by pair descending to match reference
-            candidates.sort(key=lambda p: (p[0], p[1]), reverse=True)
+                # Count all adjacent byte pairs
+                pair_counts = BPETokenizer._count_byte_pairs(
+                    word_byte_freqs, n_workers=n_workers, pool=pool
+                )
 
-            # Debug: Log pair frequencies for problematic iterations
-            if logger.isEnabledFor(logging.DEBUG) and iteration > 54 and iteration < 80:
-                logger.debug(f"Iteration {iteration}: Top 10 pairs by frequency:")
-                for idx, p in enumerate(candidates[:10]):
-                    try:
-                        p1_str = p[0].decode('utf-8', errors='replace')
-                        p2_str = p[1].decode('utf-8', errors='replace')
-                        logger.debug(f"  {idx}: ({p1_str!r}, {p2_str!r}) = {max_count}")
-                    except Exception:
-                        logger.debug(f"  {idx}: {p} = {max_count}")
+                if not pair_counts:
+                    logger.debug("No more pairs to merge")
+                    break
 
-            for pair in candidates:
-                if pair in skipped_pairs:
-                    continue
-                merged_token = pair[0] + pair[1]
-                if merged_token in existed_tokens:
-                    skipped_pairs.add(pair)
-                    continue
-                most_frequent_pair = pair
-                found_valid_pair = True
-                if example_mode:
-                    t1 = most_frequent_pair[0].decode("utf-8", errors="replace")
-                    t2 = most_frequent_pair[1].decode("utf-8", errors="replace")
-                    merged_str = merged_token.decode("utf-8", errors="replace")
-                    logger.info("Iteration %d: Merge (%r, %r) -> %r (frequency=%d)", iteration, t1, t2, merged_str, max_count)
-                break
+                # Find the most frequent pair that hasn't been skipped.
+                # Use min-heap by (-count,) so we only pop pairs with current max count;
+                # then sort the (small) batch by pair desc for exact reference tie-break.
+                # O(n) heapify + O(k log n) pops to drain max-count tier + O(m log m) sort
+                # where m = number of pairs with max count (usually 1).
+                max_count = max(pair_counts.values()) if pair_counts else 0
+                # Heap key is just -count so we pop highest-count pairs first
+                heap = [(-c, p) for p, c in pair_counts.items()]
+                heapq.heapify(heap)
+                found_valid_pair = False
+                # Drain all pairs with count == max_count (they have key -max_count)
+                candidates = []
+                while heap and heap[0][0] == -max_count:
+                    _, pair = heapq.heappop(heap)
+                    candidates.append(pair)
+                # Tie-break: sort by pair descending to match reference
+                candidates.sort(key=lambda p: (p[0], p[1]), reverse=True)
 
-            if not found_valid_pair:
-                logger.debug("All remaining pairs create existing tokens")
-                break
+                # Debug: Log pair frequencies for problematic iterations
+                if logger.isEnabledFor(logging.DEBUG) and iteration > 54 and iteration < 80:
+                    logger.debug(f"Iteration {iteration}: Top 10 pairs by frequency:")
+                    for idx, p in enumerate(candidates[:10]):
+                        try:
+                            p1_str = p[0].decode('utf-8', errors='replace')
+                            p2_str = p[1].decode('utf-8', errors='replace')
+                            logger.debug(f"  {idx}: ({p1_str!r}, {p2_str!r}) = {max_count}")
+                        except Exception:
+                            logger.debug(f"  {idx}: {p} = {max_count}")
 
-            # Check if we've reached vocab size limit
-            if len(vocab) >= vocab_size:
-                break
+                for pair in candidates:
+                    if pair in skipped_pairs:
+                        continue
+                    merged_token = pair[0] + pair[1]
+                    if merged_token in existed_tokens:
+                        skipped_pairs.add(pair)
+                        continue
+                    most_frequent_pair = pair
+                    found_valid_pair = True
+                    if example_mode:
+                        t1 = most_frequent_pair[0].decode("utf-8", errors="replace")
+                        t2 = most_frequent_pair[1].decode("utf-8", errors="replace")
+                        merged_str = merged_token.decode("utf-8", errors="replace")
+                        logger.info("Iteration %d: Merge (%r, %r) -> %r (frequency=%d)", iteration, t1, t2, merged_str, max_count)
+                    break
 
-            # Add merged token to vocabulary
-            vocab[curr_next_token] = merged_token
-            curr_next_token += 1
-            existed_tokens.add(merged_token)
+                if not found_valid_pair:
+                    logger.debug("All remaining pairs create existing tokens")
+                    break
 
-            # Record the merge
-            merges.append(most_frequent_pair)
+                # Check if we've reached vocab size limit
+                if len(vocab) >= vocab_size:
+                    break
 
-            # Merge the pair in all words
-            word_byte_freqs = BPETokenizer._apply_merge(
-                word_byte_freqs, most_frequent_pair, merged_token
-            )
+                # Add merged token to vocabulary
+                vocab[curr_next_token] = merged_token
+                curr_next_token += 1
+                existed_tokens.add(merged_token)
+
+                # Record the merge
+                merges.append(most_frequent_pair)
+
+                # Merge the pair in all words
+                word_byte_freqs = BPETokenizer._apply_merge(
+                    word_byte_freqs, most_frequent_pair, merged_token,
+                    n_workers=n_workers, pool=pool
+                )
+
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
         return merges
 
     @staticmethod
     def _count_byte_pairs(
-        word_byte_freqs: Dict[Tuple[bytes, ...], int]
+        word_byte_freqs: Dict[Tuple[bytes, ...], int],
+        n_workers: int = _DEFAULT_N_WORKERS,
+        pool: Optional[multiprocessing.Pool] = None,
     ) -> Counter:
         """Count frequencies of adjacent byte pairs across all words.
 
-        Args:
-            word_byte_freqs: Dictionary mapping byte tuples to frequencies
-
-        Returns:
-            Counter of byte pair frequencies
+        Uses multiprocessing when word_byte_freqs is large enough and pool or n_workers > 1.
         """
-        pair_counts = Counter()
+        items = list(word_byte_freqs.items())
+        use_parallel = (
+            len(items) >= _PARALLEL_THRESHOLD_WORD_FREQS
+            and (n_workers > 1 or pool is not None)
+        )
+        if not use_parallel:
+            return _count_pairs_chunk(items)
 
-        for word_bytes_tuple, freq in word_byte_freqs.items():
-            # Count pairs in this word
-            for i in range(len(word_bytes_tuple) - 1):
-                pair = (word_bytes_tuple[i], word_bytes_tuple[i + 1])
-                pair_counts[pair] += freq
-
+        chunk_size = max(1, (len(items) + n_workers - 1) // n_workers)
+        chunks = [
+            items[i : i + chunk_size]
+            for i in range(0, len(items), chunk_size)
+        ]
+        if pool is not None:
+            chunk_counters = pool.map(_count_pairs_chunk, chunks)
+        else:
+            with multiprocessing.Pool(processes=n_workers) as p:
+                chunk_counters = p.map(_count_pairs_chunk, chunks)
+        pair_counts = sum(chunk_counters, Counter())
         return pair_counts
 
     @staticmethod
@@ -402,38 +475,37 @@ class BPETokenizer:
         word_byte_freqs: Dict[Tuple[bytes, ...], int],
         pair_bytes: Tuple[bytes, bytes],
         merged_token: bytes,
+        n_workers: int = _DEFAULT_N_WORKERS,
+        pool: Optional[multiprocessing.Pool] = None,
     ) -> Dict[Tuple[bytes, ...], int]:
         """Apply a merge operation to all words.
 
-        Args:
-            word_byte_freqs: Dictionary mapping byte tuples to frequencies
-            pair_bytes: The pair of bytes to merge
-            merged_token: The merged token to replace the pair
-
-        Returns:
-            Updated dictionary with merged pairs
+        Uses multiprocessing when word_byte_freqs is large enough and pool or n_workers > 1.
         """
+        items = list(word_byte_freqs.items())
+        use_parallel = (
+            len(items) >= _PARALLEL_THRESHOLD_WORD_FREQS
+            and (n_workers > 1 or pool is not None)
+        )
+        if not use_parallel:
+            return _apply_merge_chunk((items, pair_bytes, merged_token))
+
+        chunk_size = max(1, (len(items) + n_workers - 1) // n_workers)
+        chunks = [
+            items[i : i + chunk_size]
+            for i in range(0, len(items), chunk_size)
+        ]
+        chunk_args = [(c, pair_bytes, merged_token) for c in chunks]
+        if pool is not None:
+            chunk_results = pool.map(_apply_merge_chunk, chunk_args)
+        else:
+            with multiprocessing.Pool(processes=n_workers) as p:
+                chunk_results = p.map(_apply_merge_chunk, chunk_args)
         new_word_byte_freqs = {}
-        for word_bytes_tuple, freq in word_byte_freqs.items():
-            new_word_bytes = []
-            i = 0
-
-            while i < len(word_bytes_tuple):
-                if (
-                    i < len(word_bytes_tuple) - 1
-                    and word_bytes_tuple[i] == pair_bytes[0]
-                    and word_bytes_tuple[i + 1] == pair_bytes[1]
-                ):
-                    # Merge this pair
-                    new_word_bytes.append(merged_token)
-                    i += 2
+        for d in chunk_results:
+            for k, v in d.items():
+                if k in new_word_byte_freqs:
+                    new_word_byte_freqs[k] += v
                 else:
-                    new_word_bytes.append(word_bytes_tuple[i])
-                    i += 1
-
-            new_word_bytes_tuple = tuple(new_word_bytes)
-            if new_word_bytes_tuple in new_word_byte_freqs:
-                new_word_byte_freqs[new_word_bytes_tuple] += freq
-            else:
-                new_word_byte_freqs[new_word_bytes_tuple] = freq
+                    new_word_byte_freqs[k] = v
         return new_word_byte_freqs
