@@ -5,7 +5,7 @@ Flow: x -> ln1 -> MHA(RoPE) -> +x -> ln2 -> SwiGLU FFN -> +residual -> output
 from cs336_basics.attention import MultiHeadAttentionWithRoPE
 from cs336_basics.rmsnorm import RMSNorm
 from cs336_basics.swiglu import silu
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from torch import Tensor
 import torch
 import torch.nn as nn
@@ -79,3 +79,71 @@ class TransformerBlock(nn.Module):
         up = einsum(ffn_input, ffn_w3_weight, "... sequence_length d_model, d_ff d_model -> ... sequence_length d_ff")
         ffn_out = einsum(silu(gate) * up, ffn_w2_weight, "... sequence_length d_ff, d_model d_ff -> ... sequence_length d_model")
         return attn_out + ffn_out  # residual connection; no final post-norm
+
+
+class TransformerLM(nn.Module):
+    """
+    Transformer language model: token embedding -> num_layers Transformer blocks -> ln_final -> lm_head -> logits.
+    Uses RoPE in each block. Forward accepts a state dict and input token indices.
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        context_length: int,
+        d_model: int,
+        num_layers: int,
+        num_heads: int,
+        d_ff: int,
+        rope_theta: float,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.context_length = context_length
+        self.d_model = d_model
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.d_ff = d_ff
+        self.rope_theta = rope_theta
+        self.block = TransformerBlock()
+
+    def forward(
+        self,
+        weights: dict[str, Tensor],
+        in_indices: Int[Tensor, " batch_size sequence_length"],
+    ) -> Float[Tensor, " batch_size sequence_length vocab_size"]:
+        # Token embedding: (batch, seq) -> (batch, seq, d_model)
+        token_emb_weight = weights["token_embeddings.weight"]  # (vocab_size, d_model)
+        x = token_emb_weight[in_indices]
+
+        # Stack of Transformer blocks (each uses RoPE; positions default to arange(seq_len) inside MHA)
+        for i in range(self.num_layers):
+            layer_weights = {
+                k.replace(f"layers.{i}.", ""): v
+                for k, v in weights.items()
+                if k.startswith(f"layers.{i}.")
+            }
+            x = self.block(
+                d_model=self.d_model,
+                num_heads=self.num_heads,
+                d_ff=self.d_ff,
+                max_seq_len=self.context_length,
+                theta=self.rope_theta,
+                weights=layer_weights,
+                in_features=x,
+            )
+
+        # Final RMSNorm
+        ln_final_weight = weights["ln_final.weight"]
+        ln_final = RMSNorm(self.d_model, device=x.device, dtype=x.dtype)
+        ln_final.weight.data.copy_(ln_final_weight)
+        x = ln_final(x)
+
+        # LM head: (batch, seq, d_model) -> (batch, seq, vocab_size)
+        lm_head_weight = weights["lm_head.weight"]  # (vocab_size, d_model)
+        logits = einsum(
+            x,
+            lm_head_weight,
+            "... seq d_model, vocab_size d_model -> ... seq vocab_size",
+        )
+        return logits

@@ -6,7 +6,7 @@ from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
 import torch
-from cs336_basics.transformer import TransformerBlock
+from cs336_basics.transformer import TransformerBlock, TransformerLM
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 from cs336_basics.tokenizer import BPETokenizer, Tokenizer
@@ -377,7 +377,16 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    lm = TransformerLM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+    )
+    return lm(weights, in_indices)
 
 
 def run_rmsnorm(
