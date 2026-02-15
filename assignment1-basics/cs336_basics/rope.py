@@ -30,8 +30,8 @@ class RoPE(nn.Module):
         self.register_buffer("inv_freq", inv_freq.to(dtype or torch.get_default_dtype()))
 
     def forward(self, x: torch.Tensor, positions: torch.Tensor | None = None) -> torch.Tensor:
-        # x: (..., seq_len, d_k)
-        _, seq_len, _ = x.shape
+        # x: (..., seq_len, d_k), supports 3D or 4D (e.g. batch, heads, seq_len, d_k)
+        seq_len = x.shape[-2]
         if positions is None:
             positions = torch.arange(seq_len, device=x.device, dtype=torch.int64)
         # positions 需能 broadcast 到 (..., seq_len)；再与 inv_freq 乘得 (..., seq_len, half_d_k)
