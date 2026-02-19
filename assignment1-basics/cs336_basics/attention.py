@@ -3,7 +3,7 @@ import torch.nn as nn
 from cs336_basics.rope import RoPE
 from jaxtyping import Float, Int
 from torch import Tensor
-from cs336_basics.softmax import softmax
+from cs336_basics.utils import softmax
 from einops import einsum, rearrange
 import math
 
